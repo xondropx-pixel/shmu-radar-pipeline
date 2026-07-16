@@ -115,7 +115,7 @@ jobs:
               --formats png \
               --resolutions full \
               --reprocess-count 12 \
-              --timeout 600 \
+              
               "${EXTRA_ARGS[@]}"
 
           echo "Vytvorené radarové PNG:"
