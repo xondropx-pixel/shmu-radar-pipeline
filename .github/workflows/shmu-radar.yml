@@ -3,7 +3,6 @@ name: SHMU radar to R2
 on:
   workflow_dispatch:
   schedule:
-    # Každých 5 minút, mierne posunuté mimo začiatku hodiny.
     - cron: "3,8,13,18,23,28,33,38,43,48,53,58 * * * *"
 
 permissions:
@@ -46,27 +45,24 @@ jobs:
             R2_BUCKET
           do
             if [ -z "${!name:-}" ]; then
-              echo "ERROR: chýba GitHub secret ${name}"
+              echo "ERROR: chýba secret ${name}"
               exit 1
             fi
           done
 
-          echo "Secrets sú nastavené."
-          echo "R2 bucket: ${R2_BUCKET}"
+          echo "R2 secrets sú nastavené."
+          echo "Bucket: ${R2_BUCKET}"
 
       - name: Prepare directories
         shell: bash
         run: |
           set -euo pipefail
 
-          rm -rf radar-raw radar-publish radar-meta
-          mkdir -p radar-raw radar-publish radar-meta
+          rm -rf radar-raw radar-publish
+          mkdir -p radar-raw radar-publish
 
           chmod 777 radar-raw
           chmod 777 radar-publish
-          chmod 777 radar-meta
-
-          echo "Pracovné priečinky pripravené."
 
       - name: Restore existing frames from R2
         shell: bash
@@ -85,10 +81,8 @@ jobs:
             --include "extent_index.json" \
             || true
 
-          echo "Obnovené súbory z R2:"
-          find radar-raw -maxdepth 3 -type f -printf "%p (%s bytes)\n" \
-            | sort \
-            || true
+          echo "Existujúce súbory:"
+          find radar-raw -type f -printf "%p (%s bytes)\n" | sort || true
 
       - name: Fetch and render SHMU radar
         shell: bash
@@ -97,200 +91,237 @@ jobs:
 
           EXTRA_ARGS=()
 
-          # Pri prvom spustení stiahne približne 3 hodiny histórie.
-          if ! find radar-raw -maxdepth 1 -type f -name "*.png" \
-            -print -quit | grep -q .
+          if ! find radar-raw \
+            -type f \
+            -name "*.png" \
+            -print \
+            -quit |
+            grep -q .
           then
-            echo "Prvý beh: sťahujem 3 hodiny histórie."
+            echo "Prvý beh: sťahujem tri hodiny histórie."
             EXTRA_ARGS+=(--backload --hours 3)
           else
-            echo "Existujúce snímky nájdené: sťahujem nové dáta."
+            echo "Existujúce snímky boli nájdené."
           fi
 
           docker run --rm \
             -v "${GITHUB_WORKSPACE}/radar-raw:/output" \
-            -v "${GITHUB_WORKSPACE}/radar-meta:/tmp/iradar-data/extent" \
             "${RADAR_IMAGE}" \
             imeteo-radar fetch \
               --source shmu \
               --output /output \
-              --update-extent \
               --disable-upload \
               --no-cache-upload \
               --formats png \
               --resolutions full \
               --reprocess-count 12 \
+              --timeout 600 \
               "${EXTRA_ARGS[@]}"
 
-          echo "Radarové PNG po spracovaní:"
-          find radar-raw -maxdepth 4 -type f -printf "%p (%s bytes)\n" \
-            | sort
-
-          echo "Extent metadata po spracovaní (radar-meta na hostiteľovi):"
-          find radar-meta -maxdepth 8 -type f -printf "%p (%s bytes)\n" \
-            | sort \
-            || true
-
-          echo "Debug: celý obsah /tmp/iradar-data vnútri kontajnera:"
-          docker run --rm \
-            -v "${GITHUB_WORKSPACE}/radar-raw:/output" \
-            -v "${GITHUB_WORKSPACE}/radar-meta:/tmp/iradar-data/extent" \
-            --entrypoint find \
-            "${RADAR_IMAGE}" \
-            /tmp/iradar-data -maxdepth 8 -type f \
-            || true
-
-      - name: Collect extent metadata
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          find_extent() {
-            find radar-meta radar-raw \
-              -type f \
-              \( -name "extent_index.json" -o -name "extent*.json" \) \
-              -print \
-              -quit
-          }
-
-          EXTENT_FILE="$(find_extent)"
-
-          # Pokus č.2: samostatný extent príkaz.
-          if [ -z "${EXTENT_FILE}" ]; then
-            echo "Extent z fetch kroku chýba. Spúšťam samostatné generovanie."
-
-            docker run --rm \
-              -v "${GITHUB_WORKSPACE}/radar-meta:/tmp/iradar-data/extent" \
-              "${RADAR_IMAGE}" \
-              imeteo-radar extent \
-                --source shmu \
-              || echo "WARN: 'imeteo-radar extent' skončil s chybou, pokračujem na ďalší fallback."
-
-            EXTENT_FILE="$(find_extent)"
-          fi
-
-          # Pokus č.3: extent bez --source (staršie/iné CLI rozhranie).
-          if [ -z "${EXTENT_FILE}" ]; then
-            echo "Skúšam 'imeteo-radar extent' bez --source ako alternatívu."
-
-            docker run --rm \
-              -v "${GITHUB_WORKSPACE}/radar-meta:/tmp/iradar-data/extent" \
-              "${RADAR_IMAGE}" \
-              imeteo-radar extent \
-              || echo "WARN: aj tento pokus zlyhal."
-
-            EXTENT_FILE="$(find_extent)"
-          fi
-
-          # Pokus č.4: núdzový extent dopočítaný priamo z existujúcich PNG.
-          # Toto zabráni pádu pipeline, kým sa nezistí skutočná príčina na
-          # strane imeteo-radar CLI. Súradnice/bounds treba doplniť podľa
-          # reálneho rozsahu SHMÚ radarových dát, ak tento fallback použiješ
-          # natrvalo.
-          if [ -z "${EXTENT_FILE}" ]; then
-            echo "WARN: extent_index.json sa nepodarilo získať od CLI ani jedným spôsobom."
-            echo "Generujem núdzový extent_index.json, aby pipeline neskončila pádom."
-
-            LATEST_PNG="$(
-              find radar-raw \
-                -maxdepth 1 \
-                -type f \
-                -regextype posix-extended \
-                -regex '.*/[0-9]{10}\.png' \
-                | sort \
-                | tail -n 1
-            )"
-
-            if [ -z "${LATEST_PNG}" ]; then
-              echo "ERROR: neexistuje ani jedna radarová PNG, z ktorej by sa dal odvodiť núdzový extent."
-              echo "Obsah radar-raw:"
-              find radar-raw -maxdepth 8 -type f -print || true
-              echo "Obsah radar-meta:"
-              find radar-meta -maxdepth 8 -type f -print || true
-              exit 1
-            fi
-
-            cat > radar-raw/extent_index.json <<EOF
-          {
-            "source": "shmu",
-            "generated_by": "fallback-in-workflow",
-            "generated_at": "$(date -u +%FT%TZ)",
-            "note": "Automaticky dogenerovaný extent, pretože imeteo-radar CLI nevrátilo extent_index.json. Over si skutočné hranice/rozsah oproti oficiálnemu výstupu nástroja."
-          }
-          EOF
-
-            EXTENT_FILE="radar-raw/extent_index.json"
-          fi
-
-          if [ -z "${EXTENT_FILE}" ] || [ ! -f "${EXTENT_FILE}" ]; then
-            echo "ERROR: extent_index.json sa nepodarilo zabezpečiť žiadnym spôsobom."
-            exit 1
-          fi
-
-          echo "Nájdený/vygenerovaný extent: ${EXTENT_FILE}"
-
-          if [ "${EXTENT_FILE}" != "radar-raw/extent_index.json" ]; then
-            cp "${EXTENT_FILE}" radar-raw/extent_index.json
-          fi
-
-          if [ ! -s radar-raw/extent_index.json ]; then
-            echo "ERROR: skopírovaný extent_index.json je prázdny."
-            exit 1
-          fi
-
-          echo "Výsledný extent_index.json:"
-          cat radar-raw/extent_index.json
-
-      - name: Validate radar output
-        shell: bash
-        run: |
-          set -euo pipefail
+          echo "Vytvorené radarové PNG:"
+          find radar-raw \
+            -type f \
+            -name "*.png" \
+            -printf "%p (%s bytes)\n" |
+            sort
 
           PNG_COUNT="$(
             find radar-raw \
               -type f \
-              -regextype posix-extended \
-              -regex '.*/[0-9]{10}\.png' \
-              | wc -l
+              -name "*.png" |
+            wc -l
           )"
-
-          echo "Počet radarových PNG: ${PNG_COUNT}"
 
           if [ "${PNG_COUNT}" -lt 1 ]; then
             echo "ERROR: nevytvorila sa žiadna radarová PNG snímka."
-            find radar-raw -maxdepth 6 -type f -print || true
             exit 1
           fi
 
-          if [ ! -s radar-raw/extent_index.json ]; then
-            echo "ERROR: radar-raw/extent_index.json chýba."
-            exit 1
-          fi
-
-      - name: Build manifest
+      - name: Create exact SHMU extent file
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ ! -f scripts/build_manifest.py ]; then
-            echo "ERROR: chýba scripts/build_manifest.py"
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}/radar-raw:/output" \
+            --entrypoint python \
+            "${RADAR_IMAGE}" \
+            -c 'import json; from datetime import datetime, timezone; from imeteo_radar.config.sources import get_source_instance; e=get_source_instance("shmu").get_extent(); w=e["wgs84"]; data={"metadata":{"title":"Radar Coverage Extent","source":"shmu","generated":datetime.now(timezone.utc).isoformat().replace("+00:00","Z")},"wgs84":{"west":float(w["west"]),"east":float(w["east"]),"south":float(w["south"]),"north":float(w["north"])}}; open("/output/extent_index.json","w",encoding="utf-8").write(json.dumps(data,indent=2))'
+
+          if [ ! -s radar-raw/extent_index.json ]; then
+            echo "ERROR: priame vytvorenie extentu zlyhalo."
             exit 1
           fi
 
-          MAX_RADAR_FRAMES=36 \
-            python3 scripts/build_manifest.py \
-              radar-raw \
-              radar-publish
+          echo "Extent bol vytvorený priamo v radar-raw:"
+          cat radar-raw/extent_index.json
 
-          echo "Obsah publikovateľného priečinka:"
+      - name: Build manifest without external script
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import json
+          import re
+          import shutil
+
+          raw = Path("radar-raw")
+          publish = Path("radar-publish")
+          max_frames = 36
+
+          extent_path = raw / "extent_index.json"
+
+          if not extent_path.is_file():
+              raise SystemExit(
+                  "ERROR: radar-raw/extent_index.json chýba"
+              )
+
+          extent_data = json.loads(
+              extent_path.read_text(encoding="utf-8")
+          )
+
+          w = extent_data["wgs84"]
+
+          extent = {
+              "west": float(w["west"]),
+              "east": float(w["east"]),
+              "south": float(w["south"]),
+              "north": float(w["north"]),
+          }
+
+          if extent["west"] >= extent["east"]:
+              raise SystemExit("ERROR: neplatný west/east extent")
+
+          if extent["south"] >= extent["north"]:
+              raise SystemExit("ERROR: neplatný south/north extent")
+
+          frames = []
+
+          for path in raw.rglob("*.png"):
+              match = re.fullmatch(
+                  r"(\d{10})\.png",
+                  path.name,
+              )
+
+              if match and path.stat().st_size > 100:
+                  frames.append(
+                      (
+                          int(match.group(1)),
+                          path,
+                      )
+                  )
+
+          frames.sort(key=lambda item: item[0])
+          frames = frames[-max_frames:]
+
+          if not frames:
+              raise SystemExit(
+                  "ERROR: nenašla sa žiadna radarová PNG snímka"
+              )
+
+          if publish.exists():
+              shutil.rmtree(publish)
+
+          publish.mkdir(parents=True)
+
+          manifest_frames = []
+
+          for timestamp, source in frames:
+              target = publish / f"{timestamp}.png"
+              shutil.copy2(source, target)
+
+              manifest_frames.append(
+                  {
+                      "time": timestamp,
+                      "file": target.name,
+                      "bytes": target.stat().st_size,
+                  }
+              )
+
+          shutil.copy2(
+              extent_path,
+              publish / "extent_index.json",
+          )
+
+          latest = manifest_frames[-1]["time"]
+
+          manifest = {
+              "version": 1,
+              "source": "SHMU",
+              "product": "zmax",
+              "generatedAt": (
+                  datetime.now(timezone.utc)
+                  .isoformat()
+                  .replace("+00:00", "Z")
+              ),
+              "latestTime": latest,
+              "latestIso": (
+                  datetime.fromtimestamp(
+                      latest,
+                      timezone.utc,
+                  )
+                  .isoformat()
+                  .replace("+00:00", "Z")
+              ),
+              "extent": extent,
+              "frames": manifest_frames,
+              "attribution": (
+                  "Radarové dáta: Slovenský "
+                  "hydrometeorologický ústav (SHMÚ)"
+              ),
+          }
+
+          manifest_path = publish / "manifest.json"
+
+          manifest_path.write_text(
+              json.dumps(
+                  manifest,
+                  ensure_ascii=False,
+                  indent=2,
+              ) + "\n",
+              encoding="utf-8",
+          )
+
+          print(
+              f"Manifest hotový: "
+              f"{len(manifest_frames)} snímok"
+          )
+
+          print(
+              manifest_path.read_text(
+                  encoding="utf-8"
+              )
+          )
+          PY
+
+      - name: Validate publish directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s radar-publish/manifest.json
+          test -s radar-publish/extent_index.json
+
+          PUBLISH_COUNT="$(
+            find radar-publish \
+              -type f \
+              -name "*.png" |
+            wc -l
+          )"
+
+          if [ "${PUBLISH_COUNT}" -lt 1 ]; then
+            echo "ERROR: radar-publish neobsahuje PNG."
+            exit 1
+          fi
+
+          echo "Publikovateľné súbory:"
           find radar-publish \
-            -maxdepth 3 \
             -type f \
-            -printf "%p (%s bytes)\n" \
-            | sort
-
-          echo "Manifest:"
-          cat radar-publish/manifest.json
+            -printf "%p (%s bytes)\n" |
+            sort
 
       - name: Upload to Cloudflare R2
         shell: bash
@@ -311,19 +342,15 @@ jobs:
             --include "manifest.json" \
             --cache-control "private,max-age=1800"
 
-          # Manifest sa nesmie dlho cachovať.
           aws s3 cp \
             radar-publish/manifest.json \
             "s3://${R2_BUCKET}/shmu/manifest.json" \
             --endpoint-url "${ENDPOINT}" \
             --no-progress \
             --content-type "application/json; charset=utf-8" \
-            --cache-control "no-store, max-age=0"
+            --cache-control "no-store,max-age=0"
 
-          echo "Súbory úspešne nahrané do:"
-          echo "s3://${R2_BUCKET}/shmu/"
-
-      - name: Verify uploaded files
+      - name: Verify R2 upload
         shell: bash
         run: |
           set -euo pipefail
@@ -342,8 +369,7 @@ jobs:
           {
             echo "### SHMÚ radar bol úspešne aktualizovaný"
             echo ""
-            echo "- R2 bucket: \`${R2_BUCKET}\`"
-            echo "- R2 priečinok: \`shmu/\`"
-            echo "- Zdroj: SHMÚ zmax"
-            echo "- Aktualizácia: \`$(date -u +%FT%TZ)\`"
+            echo "- Bucket: \`${R2_BUCKET}\`"
+            echo "- Prefix: \`shmu/\`"
+            echo "- Čas: \`$(date -u +%FT%TZ)\`"
           } >> "${GITHUB_STEP_SUMMARY}"
