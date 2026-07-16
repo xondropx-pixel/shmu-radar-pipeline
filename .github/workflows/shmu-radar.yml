@@ -6,6 +6,9 @@ on:
     # Každých 5 minút, posunuté mimo začiatku hodiny.
     - cron: "3,8,13,18,23,28,33,38,43,48,53,58 * * * *"
 
+permissions:
+  contents: read
+
 concurrency:
   group: shmu-radar-pipeline
   cancel-in-progress: false
@@ -13,7 +16,8 @@ concurrency:
 jobs:
   radar:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
+
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -22,87 +26,111 @@ jobs:
       AWS_EC2_METADATA_DISABLED: "true"
       R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      RADAR_IMAGE: lfranko/imeteo-radar:2.8.1
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Validate secrets
         shell: bash
         run: |
           set -euo pipefail
+
           for name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY R2_ACCOUNT_ID R2_BUCKET; do
-            test -n "${!name:-}" || { echo "Missing secret: $name"; exit 1; }
+            if [ -z "${!name:-}" ]; then
+              echo "Missing secret: ${name}"
+              exit 1
+            fi
           done
+
+      - name: Prepare directories
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf radar-raw radar-publish
+          mkdir -p radar-raw radar-publish
+          chmod 777 radar-raw radar-publish
 
       - name: Restore existing frames from R2
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf radar-raw radar-publish
-          mkdir -p radar-raw radar-publish
-          chmod 777 radar-raw
+
           ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
           aws s3 sync "s3://${R2_BUCKET}/shmu/" radar-raw/ \
-            --endpoint-url "$ENDPOINT" \
+            --endpoint-url "${ENDPOINT}" \
             --no-progress \
             --exclude "*" \
             --include "*.png" \
             --include "extent_index.json"
 
-            - name: Fetch and render SHMU radar
+      - name: Fetch and render SHMU radar
+        shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
-          mkdir -p output
+          EXTRA_ARGS=()
+
+          # Pri prvom behu stiahni približne tri hodiny histórie.
+          if ! compgen -G "radar-raw/*.png" >/dev/null; then
+            EXTRA_ARGS+=(--backload --hours 3)
+          fi
 
           docker run --rm \
-            -v "${{ github.workspace }}/output:/out" \
-            --entrypoint sh \
-            lfranko/imeteo-radar:latest \
-            -lc '
-              imeteo-radar fetch \
-                --source shmu \
-                --output /out \
-                --backload \
-                --hours 3 \
-                --reprocess-count 36 \
-                --update-extent \
-                --disable-upload
+            -v "${GITHUB_WORKSPACE}/radar-raw:/output" \
+            "${RADAR_IMAGE}" \
+            imeteo-radar fetch \
+              --source shmu \
+              --output /output \
+              --disable-upload \
+              --formats png \
+              --resolutions full \
+              --reprocess-count 12 \
+              "${EXTRA_ARGS[@]}"
 
-              echo "Hľadám extent_index.json..."
-              find /tmp -name extent_index.json -type f -print
+      - name: Generate radar extent
+        shell: bash
+        run: |
+          set -euo pipefail
 
-              EXTENT_FILE="$(find /tmp/iradar-data -name extent_index.json -type f | head -n 1)"
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}/radar-raw:/output" \
+            "${RADAR_IMAGE}" \
+            imeteo-radar extent \
+              --source shmu \
+              --output /output
 
-              if [ -z "$EXTENT_FILE" ]; then
-                echo "CHYBA: extent_index.json sa v kontajneri nenašiel"
-                exit 1
-              fi
+          echo "Obsah radar-raw po vytvorení extentu:"
+          find radar-raw -maxdepth 4 -type f -printf "%p (%s bytes)\n" | sort
 
-              cp "$EXTENT_FILE" /out/extent_index.json
-
-              echo "Výsledné súbory:"
-              ls -lah /out
-            '
-
-          test -f output/extent_index.json
-          echo "OK: output/extent_index.json existuje"
+          if ! find radar-raw -name extent_index.json -type f -print -quit | grep -q .; then
+            echo "ERROR: extent_index.json sa nevytvoril"
+            exit 1
+          fi
 
       - name: Build manifest
         shell: bash
         run: |
           set -euo pipefail
-          MAX_RADAR_FRAMES=36 python scripts/build_manifest.py radar-raw radar-publish
+
+          MAX_RADAR_FRAMES=36 \
+            python3 scripts/build_manifest.py radar-raw radar-publish
+
+          echo "Vytvorený manifest:"
           cat radar-publish/manifest.json
 
       - name: Upload to Cloudflare R2
         shell: bash
         run: |
           set -euo pipefail
+
           ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
           aws s3 sync radar-publish/ "s3://${R2_BUCKET}/shmu/" \
-            --endpoint-url "$ENDPOINT" \
+            --endpoint-url "${ENDPOINT}" \
             --delete \
             --no-progress \
             --exclude "*" \
@@ -110,8 +138,21 @@ jobs:
             --include "extent_index.json" \
             --include "manifest.json" \
             --cache-control "private,max-age=1800"
-          aws s3 cp radar-publish/manifest.json "s3://${R2_BUCKET}/shmu/manifest.json" \
-            --endpoint-url "$ENDPOINT" \
+
+          # Manifest sa nesmie dlho cachovať, aby appka videla nové snímky.
+          aws s3 cp radar-publish/manifest.json \
+            "s3://${R2_BUCKET}/shmu/manifest.json" \
+            --endpoint-url "${ENDPOINT}" \
             --no-progress \
             --content-type "application/json; charset=utf-8" \
             --cache-control "no-store, max-age=0"
+
+      - name: Summary
+        if: success()
+        shell: bash
+        run: |
+          echo "### SHMÚ radar bol úspešne aktualizovaný" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- R2 bucket: \`${R2_BUCKET}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- R2 prefix: \`shmu/\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Čas: \`$(date -u +%FT%TZ)\`" >> "${GITHUB_STEP_SUMMARY}"
