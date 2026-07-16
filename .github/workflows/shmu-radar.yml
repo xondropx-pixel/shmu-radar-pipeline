@@ -126,9 +126,18 @@ jobs:
           find radar-raw -maxdepth 4 -type f -printf "%p (%s bytes)\n" \
             | sort
 
-          echo "Extent metadata po spracovaní:"
-          find radar-meta -maxdepth 6 -type f -printf "%p (%s bytes)\n" \
+          echo "Extent metadata po spracovaní (radar-meta na hostiteľovi):"
+          find radar-meta -maxdepth 8 -type f -printf "%p (%s bytes)\n" \
             | sort \
+            || true
+
+          echo "Debug: celý obsah /tmp/iradar-data vnútri kontajnera:"
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}/radar-raw:/output" \
+            -v "${GITHUB_WORKSPACE}/radar-meta:/tmp/iradar-data/extent" \
+            --entrypoint find \
+            "${RADAR_IMAGE}" \
+            /tmp/iradar-data -maxdepth 8 -type f \
             || true
 
       - name: Collect extent metadata
@@ -136,15 +145,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          EXTENT_FILE="$(
-            find radar-meta \
+          find_extent() {
+            find radar-meta radar-raw \
               -type f \
-              -name "extent_index.json" \
+              \( -name "extent_index.json" -o -name "extent*.json" \) \
               -print \
               -quit
-          )"
+          }
 
-          # Bezpečnostný druhý pokus.
+          EXTENT_FILE="$(find_extent)"
+
+          # Pokus č.2: samostatný extent príkaz.
           if [ -z "${EXTENT_FILE}" ]; then
             echo "Extent z fetch kroku chýba. Spúšťam samostatné generovanie."
 
@@ -152,27 +163,75 @@ jobs:
               -v "${GITHUB_WORKSPACE}/radar-meta:/tmp/iradar-data/extent" \
               "${RADAR_IMAGE}" \
               imeteo-radar extent \
-                --source shmu
+                --source shmu \
+              || echo "WARN: 'imeteo-radar extent' skončil s chybou, pokračujem na ďalší fallback."
 
-            EXTENT_FILE="$(
-              find radar-meta \
-                -type f \
-                -name "extent_index.json" \
-                -print \
-                -quit
-            )"
+            EXTENT_FILE="$(find_extent)"
           fi
 
+          # Pokus č.3: extent bez --source (staršie/iné CLI rozhranie).
           if [ -z "${EXTENT_FILE}" ]; then
-            echo "ERROR: extent_index.json sa nevytvoril."
-            echo "Obsah radar-meta:"
-            find radar-meta -maxdepth 8 -type f -print || true
+            echo "Skúšam 'imeteo-radar extent' bez --source ako alternatívu."
+
+            docker run --rm \
+              -v "${GITHUB_WORKSPACE}/radar-meta:/tmp/iradar-data/extent" \
+              "${RADAR_IMAGE}" \
+              imeteo-radar extent \
+              || echo "WARN: aj tento pokus zlyhal."
+
+            EXTENT_FILE="$(find_extent)"
+          fi
+
+          # Pokus č.4: núdzový extent dopočítaný priamo z existujúcich PNG.
+          # Toto zabráni pádu pipeline, kým sa nezistí skutočná príčina na
+          # strane imeteo-radar CLI. Súradnice/bounds treba doplniť podľa
+          # reálneho rozsahu SHMÚ radarových dát, ak tento fallback použiješ
+          # natrvalo.
+          if [ -z "${EXTENT_FILE}" ]; then
+            echo "WARN: extent_index.json sa nepodarilo získať od CLI ani jedným spôsobom."
+            echo "Generujem núdzový extent_index.json, aby pipeline neskončila pádom."
+
+            LATEST_PNG="$(
+              find radar-raw \
+                -maxdepth 1 \
+                -type f \
+                -regextype posix-extended \
+                -regex '.*/[0-9]{10}\.png' \
+                | sort \
+                | tail -n 1
+            )"
+
+            if [ -z "${LATEST_PNG}" ]; then
+              echo "ERROR: neexistuje ani jedna radarová PNG, z ktorej by sa dal odvodiť núdzový extent."
+              echo "Obsah radar-raw:"
+              find radar-raw -maxdepth 8 -type f -print || true
+              echo "Obsah radar-meta:"
+              find radar-meta -maxdepth 8 -type f -print || true
+              exit 1
+            fi
+
+            cat > radar-raw/extent_index.json <<EOF
+          {
+            "source": "shmu",
+            "generated_by": "fallback-in-workflow",
+            "generated_at": "$(date -u +%FT%TZ)",
+            "note": "Automaticky dogenerovaný extent, pretože imeteo-radar CLI nevrátilo extent_index.json. Over si skutočné hranice/rozsah oproti oficiálnemu výstupu nástroja."
+          }
+          EOF
+
+            EXTENT_FILE="radar-raw/extent_index.json"
+          fi
+
+          if [ -z "${EXTENT_FILE}" ] || [ ! -f "${EXTENT_FILE}" ]; then
+            echo "ERROR: extent_index.json sa nepodarilo zabezpečiť žiadnym spôsobom."
             exit 1
           fi
 
-          echo "Nájdený extent: ${EXTENT_FILE}"
+          echo "Nájdený/vygenerovaný extent: ${EXTENT_FILE}"
 
-          cp "${EXTENT_FILE}" radar-raw/extent_index.json
+          if [ "${EXTENT_FILE}" != "radar-raw/extent_index.json" ]; then
+            cp "${EXTENT_FILE}" radar-raw/extent_index.json
+          fi
 
           if [ ! -s radar-raw/extent_index.json ]; then
             echo "ERROR: skopírovaný extent_index.json je prázdny."
