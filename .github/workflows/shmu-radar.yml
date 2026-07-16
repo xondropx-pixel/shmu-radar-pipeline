@@ -50,26 +50,44 @@ jobs:
             --include "*.png" \
             --include "extent_index.json"
 
-      - name: Fetch and render SHMU radar
-        shell: bash
+            - name: Fetch and render SHMU radar
         run: |
-          set -euo pipefail
-          EXTRA_ARGS=()
-          if ! compgen -G "radar-raw/*.png" >/dev/null; then
-            EXTRA_ARGS+=(--backload --hours 3)
-          fi
+          set -euxo pipefail
+
+          mkdir -p output
+
           docker run --rm \
-            -v "$PWD/radar-raw:/output" \
-            lfranko/imeteo-radar:2.8.1 \
-            imeteo-radar fetch \
-              --source shmu \
-              --output /output \
-              --update-extent \
-              --disable-upload \
-              --formats png \
-              --resolutions full \
-              --reprocess-count 12 \
-              "${EXTRA_ARGS[@]}"
+            -v "${{ github.workspace }}/output:/out" \
+            --entrypoint sh \
+            lfranko/imeteo-radar:latest \
+            -lc '
+              imeteo-radar fetch \
+                --source shmu \
+                --output /out \
+                --backload \
+                --hours 3 \
+                --reprocess-count 36 \
+                --update-extent \
+                --disable-upload
+
+              echo "Hľadám extent_index.json..."
+              find /tmp -name extent_index.json -type f -print
+
+              EXTENT_FILE="$(find /tmp/iradar-data -name extent_index.json -type f | head -n 1)"
+
+              if [ -z "$EXTENT_FILE" ]; then
+                echo "CHYBA: extent_index.json sa v kontajneri nenašiel"
+                exit 1
+              fi
+
+              cp "$EXTENT_FILE" /out/extent_index.json
+
+              echo "Výsledné súbory:"
+              ls -lah /out
+            '
+
+          test -f output/extent_index.json
+          echo "OK: output/extent_index.json existuje"
 
       - name: Build manifest
         shell: bash
