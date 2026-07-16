@@ -84,30 +84,34 @@ jobs:
           echo "Existujúce súbory:"
           find radar-raw -type f -printf "%p (%s bytes)\n" | sort || true
 
-      - name: Fetch and render SHMU radar
+           - name: Fetch and render SHMU radar
         shell: bash
         run: |
           set -euo pipefail
 
-          EXTRA_ARGS=()
+          if compgen -G "radar-raw/*.png" > /dev/null; then
+            echo "Existujúce radarové snímky boli nájdené."
+            echo "Sťahujem iba najnovšie SHMÚ dáta."
 
-          if ! find radar-raw \
-            -type f \
-            -name "*.png" \
-            -print \
-            -quit |
-            grep -q .
-          then
-            echo "Prvý beh: sťahujem tri hodiny histórie."
-            EXTRA_ARGS+=(--backload --hours 3)
+            docker run --rm \
+              -v "${GITHUB_WORKSPACE}/radar-raw:/output" \
+              "${RADAR_IMAGE}" \
+              imeteo-radar fetch \
+              --source shmu \
+              --output /output \
+              --disable-upload \
+              --no-cache-upload \
+              --formats png \
+              --resolutions full \
+              --reprocess-count 12
+
           else
-            echo "Existujúce snímky boli nájdené."
-          fi
+            echo "Prvý beh: sťahujem tri hodiny histórie."
 
-          docker run --rm \
-            -v "${GITHUB_WORKSPACE}/radar-raw:/output" \
-            "${RADAR_IMAGE}" \
-            imeteo-radar fetch \
+            docker run --rm \
+              -v "${GITHUB_WORKSPACE}/radar-raw:/output" \
+              "${RADAR_IMAGE}" \
+              imeteo-radar fetch \
               --source shmu \
               --output /output \
               --disable-upload \
@@ -115,22 +119,26 @@ jobs:
               --formats png \
               --resolutions full \
               --reprocess-count 12 \
-              
-              "${EXTRA_ARGS[@]}"
+              --backload \
+              --hours 3
+          fi
 
           echo "Vytvorené radarové PNG:"
+
           find radar-raw \
             -type f \
             -name "*.png" \
-            -printf "%p (%s bytes)\n" |
-            sort
+            -printf "%p (%s bytes)\n" \
+            | sort
 
           PNG_COUNT="$(
             find radar-raw \
               -type f \
-              -name "*.png" |
-            wc -l
+              -name "*.png" \
+              | wc -l
           )"
+
+          echo "Počet PNG snímok: ${PNG_COUNT}"
 
           if [ "${PNG_COUNT}" -lt 1 ]; then
             echo "ERROR: nevytvorila sa žiadna radarová PNG snímka."
